@@ -1,0 +1,164 @@
+clear
+clc
+
+%% Obtain the discrete-time state-space system
+
+parameters
+
+F1 = 250;
+F2 = 325;
+F3 = 100;
+F4 = 100;
+
+u = [F1;F2];
+d = [F3;F4];
+
+[xs,hs] = findsteadystate(u,d,p);
+
+sys_l = linmod('systemlin',xs,[u;d]);
+
+A = sys_l.a;
+B = sys_l.b(:,1:2);
+Bv = sys_l.b(:,3:4);
+C = sys_l.c;
+D = zeros(2,2);
+
+% Sample time
+Ts = 5;
+
+sysc = ss(A,B,C,D);
+sysd = c2d(sysc,Ts);
+
+Ad = sysd.a;
+Bd = sysd.b;
+Cd = sysd.c;
+Dd = sysd.d;
+[~,Bvd] = c2d(A,Bv,Ts);
+
+%% Compute the MPC related matrices
+
+% Depth
+n = 30*Ts;
+
+% Weighting Matrices
+Q = [1 0;0 1];
+S = [1 0;0 1];
+
+% Build Matrices for Control Law
+[H,Mx0,Mr,Mu_1,Md,Aqp,Phi,Gamma_d] = MPCmat(Ad,Bd,Cd,Bvd,Q,S,n);
+Aqp_int = [zeros(2*n);eye(2*n)];
+Aqp = [Aqp Aqp_int; Aqp(2*n+1:end,:) -eye(2*n)];
+
+% Penalty weighting
+Qw = [100 0;0 100];
+Hw = kron(eye(n),Qw);
+H = [H zeros(length(H)); zeros(length(H)) Hw];
+
+%% Simulate with MPC
+
+% Simulation length
+k_0 = 0;
+k_f = 250;
+sim_length = k_0:k_f;
+
+% Create a ramp and step in the simulation
+ch_ref = ceil(k_f/3);
+r1 = [(hs(1):((80-hs(1))/ch_ref):80) 80*ones(1,ch_ref) 10*ones(1,ch_ref+n)]'-hs(1);
+r2 = [(hs(2):((80-hs(2))/ch_ref):80) 80*ones(1,ch_ref) 10*ones(1,ch_ref+n)]'-hs(2);
+ref = zeros(length(r1)+length(r2),1);
+ref(1:2:end) = r1;
+ref(2:2:end) = r2;
+
+% Set upper and lower limits for Inputs
+u_min = [0;0]-[F1;F2];
+u_max = [600;600]-[F1;F2];
+U_min = [repmat(u_min,n,1);zeros(2*n,1)];
+U_max = [repmat(u_max,n,1);inf*ones(2*n,1)];
+
+% Min-Max outputs
+Zmin = [9.5;9.5]-hs(1:2);
+Zmin = MPCref(Zmin,n);
+Zmax = [80.5;80.5]-hs(1:2);
+Zmax = MPCref(Zmax,n);
+
+% Initial conditions
+zd = []; yd = []; Td = []; ud = []; set_p = []; x = xs; u = [F1;F2]; d = [F3;F4];
+xh = [0;0;0;0]; Pk = 10; xhd =[]; Pd = []; Qk = 100*eye(2); Rk = 1*eye(2);
+for k = sim_length
+    % Simulation
+    [T,X] = ode15s(@ModifiedFourTankSystem,[k*Ts (k+1)*Ts],x,[],u,d,p);
+    x = real(X(end,:)');
+    Td = [Td;T(1:end-1)];
+    yd = [yd; (Cd*X(1:end-1,:)')'];
+    y = Cd*x;
+    %yd = [yd;y'];
+    ud = [ud; u' d'];
+    
+    % Set to deviation variable
+    y = y-hs(1:2);
+    u = u-[F1;F2];
+    % State Estimation
+    [xh,Pk] = statestimator(xh,Pk,Ad,Bd,Bvd,Cd,u,y,Rk,Qk);
+    xhd = [xhd xh];
+    
+     % Select reference
+    i_ref = 2*k+1;
+    R = ref(i_ref:(i_ref+2*n-1));
+    % Control Law
+        % Delta U
+    d_u_min = [-10;-10];
+    D_U_min = MPCdu(d_u_min,n,u);
+    d_u_max = [10;10];
+    D_U_max = MPCdu(d_u_max,n,u);
+        % Zbar
+    c = Phi*xh+Gamma_d*MPCref(d,n);
+    Zbarmin = Zmin - c;
+    Zbarmax = Zmax - c;
+        % solving QP
+    gu = Mx0*xh+Mr*R+Mu_1*u;
+    g = [gu;zeros(length(gu),1)];
+    [u,info] = qpsolver(H,g,U_min,U_max,Aqp,[D_U_min;Zbarmin;-inf*ones(2*n,1)],[D_U_max;inf*ones(2*n,1);Zbarmax],[]);
+    u = [u(1);u(2)];
+    
+    % Set to real variable
+    u = u+[F1;F2];
+    
+    set_p = [set_p;R(1:2)'+hs(1:2)'];
+end
+
+%% Plot outputs and inputs
+
+figure('Units','inches','Position',[0 0 6.693 4],'PaperPositionMode','auto');
+set(0, 'defaultAxesTickLabelInterpreter','latex'); set(0, 'defaultLegendInterpreter','latex');
+set(0,'defaultTextInterpreter','latex');
+
+subplot(2,1,1)
+stairs(Td,yd(:,1),'k','linewidth',1.3)
+hold on
+stairs(Td,yd(:,2),'Color', [0.5 0.5 0.5],'linewidth',1.3)
+stairs(k_0:Ts:k_f*Ts,set_p(:,1),'k:','linewidth',0.8)
+stairs(k_0:Ts:k_f*Ts,set_p(:,2),':','Color', [0.5 0.5 0.5],'linewidth',0.8)
+hold off
+grid('on')
+xlabel('Time [s]')
+ylabel('$y$ [cm]')
+xlim([k_0 k_f*Ts])
+ylim([0 95])
+legend('$y_1$','$y_2$','$r_1$','$r_2$')
+
+subplot(2,1,2)
+stairs(k_0:Ts:k_f*Ts,ud(:,1),'k','linewidth',1.3)
+hold on
+stairs(k_0:Ts:k_f*Ts,ud(:,2),'Color', [0.5 0.5 0.5],'linewidth',1.3)
+hold off
+grid('on')
+xlabel('Time [s]')
+ylabel('$u$ [cm$^3$ s$^{-1}$]')
+xlim([k_0 k_f*Ts])
+ylim([-80 700])
+legend('$u_1$','$u_2$')
+
+sgtitle('Input and output-constrained MPC controlling nonlinear deterministic model','FontSize',11)
+
+set(subplot(2,1,1), 'Position', [.065, .55, .90, .35]);
+set(subplot(2,1,2), 'Position', [.065, .085, .90, .35]);
